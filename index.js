@@ -301,15 +301,9 @@ client.on("interactionCreate", async interaction => {
             return `**Group ${index + 1}:** ${mentions}`;
         });
 
-        const roleNames = selectedRoles
-            .map(role => role.name)
-            .join(", ");
-
         await interaction.editReply({
             content:
                 `**This Week's Every1s**\n` +
-                `**Roles:** ${roleNames}\n` +
-                `**Eligible members:** ${members.length}\n\n` +
                 lines.join("\n"),
             allowedMentions: {
                 parse: ["users"]
