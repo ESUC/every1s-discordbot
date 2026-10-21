@@ -1,15 +1,18 @@
 
 require("dotenv").config();
 
+const fs = require("node:fs");
+const path = require("node:path");
+
 const {
     Client,
     GatewayIntentBits,
     SlashCommandBuilder,
     REST,
-    Routes
+    Routes,
+    PermissionFlagsBits
 } = require("discord.js");
 
-// Initialize the Discord bot
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -17,59 +20,137 @@ const client = new Client({
     ]
 });
 
-// Define the slash command
-const command = new SlashCommandBuilder()
+// Pairing history is saved beside index.js.
+const HISTORY_FILE = path.join(__dirname, "pairing-history.json");
+
+// History is stored separately for each Discord server.
+function loadHistory() {
+    try {
+        if (!fs.existsSync(HISTORY_FILE)) {
+            return {};
+        }
+
+        return JSON.parse(
+            fs.readFileSync(HISTORY_FILE, "utf8")
+        );
+    } catch (error) {
+        console.error("Could not read pairing history:", error);
+        throw new Error(
+            "Pairing history could not be loaded. " +
+            "Fix the history file before generating new groups."
+        );
+    }
+}
+
+function saveHistory(history) {
+    fs.writeFileSync(
+        HISTORY_FILE,
+        JSON.stringify(history, null, 2),
+        "utf8"
+    );
+}
+
+let history = loadHistory();
+
+// Define slash commands
+const every1sCommand = new SlashCommandBuilder()
     .setName("every1s")
-    .setDescription("Randomly pair members from selected roles")
+    .setDescription("Randomly pair members without repeating previous pairs")
     .addStringOption(option =>
         option
             .setName("roles")
-            .setDescription(
-                "Enter one or more role mentions, e.g. @Board @Interns"
-            )
+            .setDescription("Enter one or more role mentions")
             .setRequired(true)
     );
 
-// Register the slash command for your server
+const resetCommand = new SlashCommandBuilder()
+    .setName("reset")
+    .setDescription("Reset all saved pairing history")
+    .setDefaultMemberPermissions(
+        PermissionFlagsBits.ManageGuild
+    );
+
 const rest = new REST({ version: "10" })
     .setToken(process.env.DISCORD_TOKEN);
 
-// Randomly shuffle an array using Fisher-Yates
+// Shuffle an array randomly
 function shuffle(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-
         [array[i], array[j]] = [array[j], array[i]];
     }
 
     return array;
 }
 
-// Create random groups
-function makeGroups(members) {
-    shuffle(members);
+// Generate a consistent key for an unordered pair.
+// A + B and B + A produce the same key.
+function pairKey(id1, id2) {
+    return [id1, id2].sort().join(":");
+}
 
+// Get every two-person combination inside every group.
+// A group of three contributes three pair keys.
+function getGroupPairKeys(groups) {
+    const keys = [];
+
+    for (const group of groups) {
+        for (let i = 0; i < group.length; i++) {
+            for (let j = i + 1; j < group.length; j++) {
+                keys.push(pairKey(group[i].id, group[j].id));
+            }
+        }
+    }
+
+    return keys;
+}
+
+// Create groups with the original pairing rules:
+// odd number >= 3: one group of three;
+// remaining members: groups of two.
+function makeGroups(members) {
+    const remaining = shuffle([...members]);
     const groups = [];
 
-    // If the number is odd, create one group of 3
-    if (members.length % 2 === 1 && members.length >= 3) {
-        groups.push(members.splice(0, 3));
+    if (remaining.length % 2 === 1 && remaining.length >= 3) {
+        groups.push(remaining.splice(0, 3));
     }
 
-    // Pair the remaining members
-    while (members.length >= 2) {
-        groups.push(members.splice(0, 2));
+    while (remaining.length >= 2) {
+        groups.push(remaining.splice(0, 2));
     }
 
-    // If only one member remains, put them in a group alone
-    if (members.length === 1) {
-        groups.push(members.splice(0, 1));
+    if (remaining.length === 1) {
+        groups.push(remaining.splice(0, 1));
     }
 
     return groups;
 }
 
-// When the bot starts
+// Try to find a grouping with no previously used pairs.
+function generateUniqueGroups(members, usedPairs) {
+    const MAX_ATTEMPTS = 10000;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        const groups = makeGroups(members);
+        const newPairs = getGroupPairKeys(groups);
+
+        const hasRepeatedPair = newPairs.some(pair =>
+            usedPairs.has(pair)
+        );
+
+        if (!hasRepeatedPair) {
+            return {
+                groups,
+                newPairs
+            };
+        }
+    }
+
+    return null;
+}
+
+// Register both slash commands when the bot starts.
 client.once("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
@@ -80,19 +161,46 @@ client.once("ready", async () => {
                 process.env.GUILD_ID
             ),
             {
-                body: [command.toJSON()]
+                body: [
+                    every1sCommand.toJSON(),
+                    resetCommand.toJSON()
+                ]
             }
         );
 
-        console.log("Registered /every1s successfully.");
+        console.log("Registered /every1s and /reset.");
     } catch (error) {
-        console.error("Failed to register command:", error);
+        console.error("Command registration failed:", error);
     }
 });
 
-// Handle slash commands
 client.on("interactionCreate", async interaction => {
     if (!interaction.isChatInputCommand()) return;
+
+    // RESET COMMAND
+    if (interaction.commandName === "reset") {
+        if (
+            !interaction.memberPermissions?.has(
+                PermissionFlagsBits.ManageGuild
+            )
+        ) {
+            return interaction.reply({
+                content: "You need Manage Server permission to reset history.",
+                ephemeral: true
+            });
+        }
+
+        // Clear history for this server only.
+        history[interaction.guildId] = [];
+        saveHistory(history);
+
+        return interaction.reply(
+            "Pairing history has been reset! " +
+            "Previous pairs can now occur again."
+        );
+    }
+
+    // EVERY1S COMMAND
     if (interaction.commandName !== "every1s") return;
 
     await interaction.deferReply();
@@ -106,10 +214,9 @@ client.on("interactionCreate", async interaction => {
             );
         }
 
-        // Get the role mentions supplied by the user
+        // Extract role IDs from role mentions.
         const rolesInput = interaction.options.getString("roles");
 
-        // Extract role IDs from mentions: <@&123456789012345678>
         const roleIds = [
             ...new Set(
                 [...rolesInput.matchAll(/<@&(\d+)>/g)]
@@ -119,12 +226,10 @@ client.on("interactionCreate", async interaction => {
 
         if (roleIds.length === 0) {
             return interaction.editReply(
-                "Please provide at least one role mention. " +
-                "Example: <@&123456789012345678>"
+                "Please provide at least one actual role mention."
             );
         }
 
-        // Verify that every role belongs to this server
         const selectedRoles = roleIds.map(id =>
             guild.roles.cache.get(id)
         );
@@ -135,14 +240,12 @@ client.on("interactionCreate", async interaction => {
             );
         }
 
-        // Fetch current server members
+        // Fetch the current members and their roles.
         await guild.members.fetch();
 
+        // Include anyone with ANY selected role, only once.
         const selectedRoleIds = new Set(roleIds);
 
-        // Include members with ANY selected role.
-        // A member with multiple selected roles is included only once.
-        // Bots are excluded.
         const members = [
             ...guild.members.cache.values()
         ].filter(member =>
@@ -159,10 +262,37 @@ client.on("interactionCreate", async interaction => {
             );
         }
 
-        // Generate random groups
-        const groups = makeGroups([...members]);
+        // Get previously used pairs for this server.
+        const usedPairs = new Set(
+            history[guild.id] || []
+        );
 
-        // Format each group using Discord mentions
+        // Find a new grouping without repeated pairs.
+        const result = generateUniqueGroups(
+            members,
+            usedPairs
+        );
+
+        if (!result) {
+            return interaction.editReply(
+                "I couldn't find a new grouping without repeated pairs " +
+                "after 10,000 attempts. The available members may not " +
+                "allow another arrangement. Try adding members or use " +
+                "/reset to start a new pairing cycle."
+            );
+        }
+
+        const { groups, newPairs } = result;
+
+        // Save only after a valid grouping has been found.
+        history[guild.id] = [
+            ...usedPairs,
+            ...newPairs
+        ];
+
+        saveHistory(history);
+
+        // Format the results with Discord mentions.
         const lines = groups.map((group, index) => {
             const mentions = group
                 .map(member => `<@${member.id}>`)
@@ -175,13 +305,12 @@ client.on("interactionCreate", async interaction => {
             .map(role => role.name)
             .join(", ");
 
-        const message =
-            `**This Week's Every1s**\n` +
-            `**Roles:** ${roleNames}\n\n` +
-            lines.join("\n");
-
         await interaction.editReply({
-            content: message,
+            content:
+                `**This Week's Every1s**\n` +
+                `**Roles:** ${roleNames}\n` +
+                `**Eligible members:** ${members.length}\n\n` +
+                lines.join("\n"),
             allowedMentions: {
                 parse: ["users"]
             }
@@ -191,10 +320,10 @@ client.on("interactionCreate", async interaction => {
         console.error("Error generating groups:", error);
 
         await interaction.editReply(
-            "Something went wrong while generating the groups."
+            "Something went wrong while generating groups. " +
+            "Check the bot console for details."
         );
     }
 });
 
-// Log in to Discord
 client.login(process.env.DISCORD_TOKEN);
