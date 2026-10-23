@@ -69,6 +69,7 @@ const every1sCommand = new SlashCommandBuilder()
             .setRequired(true)
     );
 
+
 const submitCommand = new SlashCommandBuilder()
     .setName("submit")
     .setDescription("Submit a pair or trio for leaderboard points")
@@ -89,7 +90,19 @@ const submitCommand = new SlashCommandBuilder()
             .setName("member3")
             .setDescription("Third member (optional)")
             .setRequired(false)
+    )
+    .addStringOption(option =>
+        option
+            .setName("location")
+            .setDescription("Where did the activity take place?")
+            .setRequired(true)
+            .addChoices(
+                { name: "Online (1 point)", value: "online" },
+                { name: "On-campus (2 points)", value: "on-campus" },
+                { name: "Off-campus (3 points)", value: "off-campus" }
+            )
     );
+
 
 const leaderboardCommand = new SlashCommandBuilder()
     .setName("leaderboard")
@@ -374,11 +387,29 @@ client.on("interactionCreate", async interaction => {
                 });
             }
 
+            // Get the selected location and determine points per member.
+            const location = interaction.options.getString("location");
+
+            const pointsByLocation = {
+                online: 1,
+                "on-campus": 2,
+                "off-campus": 3,
+            };
+
+            const pointsEarned = pointsByLocation[location];
+
+            if (!pointsEarned) {
+                return interaction.reply({
+                    content: "Please select a valid location.",
+                    ephemeral: true,
+                });
+            }
+
             // Save the unique submission and award one point per member.
             data.submissions.push(key);
 
             for (const id of ids) {
-                data.scores[id] = (data.scores[id] || 0) + 1;
+                data.scores[id] = (data.scores[id] || 0) + pointsEarned;
             }
 
             saveLeaderboard();
@@ -394,7 +425,8 @@ client.on("interactionCreate", async interaction => {
             const lines = [
                 "## Submission accepted!",
                 `**Group:** ${submittedGroup}`,
-                "Each member earned **1 point**.",
+                `**Location:** ${location}`,
+                `**Points earned per member:** ${pointsEarned}`,
                 "",
                 "**Updated scores:**",
                 ...updatedScores,
