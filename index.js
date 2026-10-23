@@ -10,49 +10,55 @@ const {
     SlashCommandBuilder,
     REST,
     Routes,
-    PermissionFlagsBits
+    PermissionFlagsBits,
 } = require("discord.js");
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers
-    ]
+        GatewayIntentBits.GuildMembers,
+    ],
 });
 
-// Pairing history is saved beside index.js.
-const HISTORY_FILE = path.join(__dirname, "pairing-history.json");
+// Locally, files are stored beside index.js.
+// On Render, set DATA_DIR=/var/data and attach a persistent disk there.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// History is stored separately for each Discord server.
-function loadHistory() {
+const HISTORY_FILE = path.join(DATA_DIR, "pairing-history.json");
+const LEADERBOARD_FILE = path.join(DATA_DIR, "leaderboard.json");
+
+// Load a JSON file, or return an empty object if it doesn't exist yet.
+function loadJson(file) {
     try {
-        if (!fs.existsSync(HISTORY_FILE)) {
+        if (!fs.existsSync(file)) {
             return {};
         }
 
-        return JSON.parse(
-            fs.readFileSync(HISTORY_FILE, "utf8")
-        );
+        return JSON.parse(fs.readFileSync(file, "utf8"));
     } catch (error) {
-        console.error("Could not read pairing history:", error);
-        throw new Error(
-            "Pairing history could not be loaded. " +
-            "Fix the history file before generating new groups."
-        );
+        console.error(`Could not read ${file}:`, error);
+        throw new Error(`Could not load ${path.basename(file)}.`);
     }
 }
 
-function saveHistory(history) {
-    fs.writeFileSync(
-        HISTORY_FILE,
-        JSON.stringify(history, null, 2),
-        "utf8"
-    );
+function saveJson(file, data) {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
 }
 
-let history = loadHistory();
+let history = loadJson(HISTORY_FILE);
+let leaderboard = loadJson(LEADERBOARD_FILE);
 
-// Define slash commands
+function saveHistory() {
+    saveJson(HISTORY_FILE, history);
+}
+
+function saveLeaderboard() {
+    saveJson(LEADERBOARD_FILE, leaderboard);
+}
+
+// ---------------- SLASH COMMANDS ----------------
+
 const every1sCommand = new SlashCommandBuilder()
     .setName("every1s")
     .setDescription("Randomly pair members without repeating previous pairs")
@@ -63,17 +69,42 @@ const every1sCommand = new SlashCommandBuilder()
             .setRequired(true)
     );
 
+const submitCommand = new SlashCommandBuilder()
+    .setName("submit")
+    .setDescription("Submit a pair or trio for leaderboard points")
+    .addUserOption(option =>
+        option
+            .setName("member1")
+            .setDescription("First member")
+            .setRequired(true)
+    )
+    .addUserOption(option =>
+        option
+            .setName("member2")
+            .setDescription("Second member")
+            .setRequired(true)
+    )
+    .addUserOption(option =>
+        option
+            .setName("member3")
+            .setDescription("Third member (optional)")
+            .setRequired(false)
+    );
+
+const leaderboardCommand = new SlashCommandBuilder()
+    .setName("leaderboard")
+    .setDescription("View all players and their scores");
+
 const resetCommand = new SlashCommandBuilder()
     .setName("reset")
-    .setDescription("Reset all saved pairing history")
-    .setDefaultMemberPermissions(
-        PermissionFlagsBits.ManageGuild
-    );
+    .setDescription("Reset pairing history and leaderboard scores")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
 
 const rest = new REST({ version: "10" })
     .setToken(process.env.DISCORD_TOKEN);
 
-// Shuffle an array randomly
+// ---------------- PAIRING FUNCTIONS ----------------
+
 function shuffle(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -83,14 +114,11 @@ function shuffle(array) {
     return array;
 }
 
-// Generate a consistent key for an unordered pair.
-// A + B and B + A produce the same key.
 function pairKey(id1, id2) {
     return [id1, id2].sort().join(":");
 }
 
-// Get every two-person combination inside every group.
-// A group of three contributes three pair keys.
+// Each trio contributes all three two-person combinations.
 function getGroupPairKeys(groups) {
     const keys = [];
 
@@ -105,9 +133,6 @@ function getGroupPairKeys(groups) {
     return keys;
 }
 
-// Create groups with the original pairing rules:
-// odd number >= 3: one group of three;
-// remaining members: groups of two.
 function makeGroups(members) {
     const remaining = shuffle([...members]);
     const groups = [];
@@ -127,7 +152,6 @@ function makeGroups(members) {
     return groups;
 }
 
-// Try to find a grouping with no previously used pairs.
 function generateUniqueGroups(members, usedPairs) {
     const MAX_ATTEMPTS = 10000;
 
@@ -135,22 +159,107 @@ function generateUniqueGroups(members, usedPairs) {
         const groups = makeGroups(members);
         const newPairs = getGroupPairKeys(groups);
 
-        const hasRepeatedPair = newPairs.some(pair =>
-            usedPairs.has(pair)
-        );
-
-        if (!hasRepeatedPair) {
-            return {
-                groups,
-                newPairs
-            };
+        if (!newPairs.some(pair => usedPairs.has(pair))) {
+            return { groups, newPairs };
         }
     }
 
     return null;
 }
 
-// Register both slash commands when the bot starts.
+// ---------------- LEADERBOARD FUNCTIONS ----------------
+
+// A submission is one unique pair or trio, regardless of member order.
+function groupKey(memberIds) {
+    return [...memberIds].sort().join(":");
+}
+
+function getGuildLeaderboard(guildId) {
+    if (
+        !leaderboard[guildId] ||
+        Array.isArray(leaderboard[guildId])
+    ) {
+        leaderboard[guildId] = {
+            submissions: [],
+            scores: {},
+        };
+    }
+
+    const data = leaderboard[guildId];
+
+    if (!Array.isArray(data.submissions)) {
+        data.submissions = [];
+    }
+
+    if (!data.scores || typeof data.scores !== "object") {
+        data.scores = {};
+    }
+
+    return data;
+}
+
+function getRankedPlayers(guildId) {
+    const data = getGuildLeaderboard(guildId);
+
+    return Object.entries(data.scores)
+        .map(([id, score]) => ({
+            id,
+            score,
+        }))
+        .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+}
+
+function formatLeaderboard(guildId) {
+    const players = getRankedPlayers(guildId);
+
+    if (players.length === 0) {
+        return ["The leaderboard is empty. Use /submit to add points!"];
+    }
+
+    return players.map((player, index) => {
+        return `**${index + 1}.** <@${player.id}> — **${player.score}** point${player.score === 1 ? "" : "s"}`;
+    });
+}
+
+// Split long output into multiple messages to stay within Discord's limit.
+async function sendLongReply(interaction, text) {
+    const chunks = [];
+    let current = "";
+
+    for (const line of text.split("\n")) {
+        if ((current + (current ? "\n" : "") + line).length > 1800) {
+            if (current) chunks.push(current);
+            current = "";
+        }
+
+        if (line.length > 1800) {
+            if (current) chunks.push(current);
+            current = "";
+            for (let i = 0; i < line.length; i += 1800) {
+                chunks.push(line.slice(i, i + 1800));
+            }
+        } else {
+            current += (current ? "\n" : "") + line;
+        }
+    }
+
+    if (current) chunks.push(current);
+
+    await interaction.reply({
+        content: chunks[0] || "No results.",
+        allowedMentions: { parse: [] },
+    });
+
+    for (let i = 1; i < chunks.length; i++) {
+        await interaction.followUp({
+            content: chunks[i],
+            allowedMentions: { parse: [] },
+        });
+    }
+}
+
+// ---------------- REGISTER COMMANDS ----------------
+
 client.once("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
@@ -163,160 +272,242 @@ client.once("ready", async () => {
             {
                 body: [
                     every1sCommand.toJSON(),
-                    resetCommand.toJSON()
-                ]
+                    submitCommand.toJSON(),
+                    leaderboardCommand.toJSON(),
+                    resetCommand.toJSON(),
+                ],
             }
         );
 
-        console.log("Registered /every1s and /reset.");
+        console.log(
+            "Registered /every1s, /submit, /leaderboard, and /reset."
+        );
     } catch (error) {
         console.error("Command registration failed:", error);
     }
 });
 
+// ---------------- HANDLE COMMANDS ----------------
+
 client.on("interactionCreate", async interaction => {
     if (!interaction.isChatInputCommand()) return;
-
-    // RESET COMMAND
-    if (interaction.commandName === "reset") {
-        if (
-            !interaction.memberPermissions?.has(
-                PermissionFlagsBits.ManageGuild
-            )
-        ) {
-            return interaction.reply({
-                content: "You need Manage Server permission to reset history.",
-                ephemeral: true
-            });
-        }
-
-        // Clear history for this server only.
-        history[interaction.guildId] = [];
-        saveHistory(history);
-
-        return interaction.reply(
-            "Pairing history has been reset! " +
-            "Previous pairs can now occur again."
-        );
-    }
-
-    // EVERY1S COMMAND
-    if (interaction.commandName !== "every1s") return;
-
-    await interaction.deferReply();
 
     try {
         const guild = interaction.guild;
 
         if (!guild) {
-            return interaction.editReply(
-                "This command must be used in a server."
+            return interaction.reply({
+                content: "Please use this command inside a Discord server.",
+                ephemeral: true,
+            });
+        }
+
+        // RESET: clear both pairing history and leaderboard for this server.
+        if (interaction.commandName === "reset") {
+            if (
+                !interaction.memberPermissions?.has(
+                    PermissionFlagsBits.ManageGuild
+                )
+            ) {
+                return interaction.reply({
+                    content: "You need Manage Server permission to reset.",
+                    ephemeral: true,
+                });
+            }
+
+            delete history[guild.id];
+            delete leaderboard[guild.id];
+
+            saveHistory();
+            saveLeaderboard();
+
+            return interaction.reply(
+                "Pairing history and leaderboard have both been reset for this server."
             );
         }
 
-        // Extract role IDs from role mentions.
-        const rolesInput = interaction.options.getString("roles");
+        // SUBMIT: award one point to each member in a new pair or trio.
+        if (interaction.commandName === "submit") {
+            const members = [
+                interaction.options.getUser("member1"),
+                interaction.options.getUser("member2"),
+                interaction.options.getUser("member3"),
+            ].filter(Boolean);
 
-        const roleIds = [
-            ...new Set(
-                [...rolesInput.matchAll(/<@&(\d+)>/g)]
-                    .map(match => match[1])
-            )
-        ];
+            const ids = members.map(member => member.id);
 
-        if (roleIds.length === 0) {
-            return interaction.editReply(
-                "Please provide at least one actual role mention."
+            if (new Set(ids).size !== ids.length) {
+                return interaction.reply({
+                    content: "Please choose different members for the submission.",
+                    ephemeral: true,
+                });
+            }
+
+            if (members.some(member => member.bot)) {
+                return interaction.reply({
+                    content: "Bots cannot be included in submissions.",
+                    ephemeral: true,
+                });
+            }
+
+            const data = getGuildLeaderboard(guild.id);
+            const key = groupKey(ids);
+
+            if (data.submissions.includes(key)) {
+                return interaction.reply({
+                    content:
+                        "That exact pair or trio has already been submitted. " +
+                        "No additional points were awarded.",
+                    ephemeral: true,
+                });
+            }
+
+            // Ensure each submitted member belongs to this server.
+            const fetchedMembers = await Promise.all(
+                ids.map(id => guild.members.fetch(id).catch(() => null))
             );
-        }
 
-        const selectedRoles = roleIds.map(id =>
-            guild.roles.cache.get(id)
-        );
+            if (fetchedMembers.some(member => !member)) {
+                return interaction.reply({
+                    content: "All submitted members must belong to this server.",
+                    ephemeral: true,
+                });
+            }
 
-        if (selectedRoles.some(role => !role)) {
-            return interaction.editReply(
-                "One or more roles could not be found in this server."
-            );
-        }
+            // Save the unique submission and award one point per member.
+            data.submissions.push(key);
 
-        // Fetch the current members and their roles.
-        await guild.members.fetch();
+            for (const id of ids) {
+                data.scores[id] = (data.scores[id] || 0) + 1;
+            }
 
-        // Include anyone with ANY selected role, only once.
-        const selectedRoleIds = new Set(roleIds);
+            saveLeaderboard();
 
-        const members = [
-            ...guild.members.cache.values()
-        ].filter(member =>
-            !member.user.bot &&
-            [...selectedRoleIds].some(roleId =>
-                member.roles.cache.has(roleId)
-            )
-        );
-
-        if (members.length < 2) {
-            return interaction.editReply(
-                `Only ${members.length} eligible member(s) found. ` +
-                "At least two members are needed."
-            );
-        }
-
-        // Get previously used pairs for this server.
-        const usedPairs = new Set(
-            history[guild.id] || []
-        );
-
-        // Find a new grouping without repeated pairs.
-        const result = generateUniqueGroups(
-            members,
-            usedPairs
-        );
-
-        if (!result) {
-            return interaction.editReply(
-                "I couldn't find a new grouping without repeated pairs " +
-                "after 10,000 attempts. The available members may not " +
-                "allow another arrangement. Try adding members or use " +
-                "/reset to start a new pairing cycle."
-            );
-        }
-
-        const { groups, newPairs } = result;
-
-        // Save only after a valid grouping has been found.
-        history[guild.id] = [
-            ...usedPairs,
-            ...newPairs
-        ];
-
-        saveHistory(history);
-
-        // Format the results with Discord mentions.
-        const lines = groups.map((group, index) => {
-            const mentions = group
+            const submittedGroup = members
                 .map(member => `<@${member.id}>`)
                 .join(" + ");
 
-            return `**Group ${index + 1}:** ${mentions}`;
-        });
+            const updatedScores = members.map(member => {
+                return `<@${member.id}>: **${data.scores[member.id]}** point${data.scores[member.id] === 1 ? "" : "s"}`;
+            });
 
-        await interaction.editReply({
-            content:
-                `**This Week's Every1s**\n` +
-                lines.join("\n"),
-            allowedMentions: {
-                parse: ["users"]
+            const lines = [
+                "## Submission accepted!",
+                `**Group:** ${submittedGroup}`,
+                "Each member earned **1 point**.",
+                "",
+                "**Updated scores:**",
+                ...updatedScores,
+                "",
+                "## Current leaderboard",
+                ...formatLeaderboard(guild.id),
+            ];
+
+            return sendLongReply(interaction, lines.join("\n"));
+        }
+
+        // LEADERBOARD: show every player, highest score first.
+        if (interaction.commandName === "leaderboard") {
+            const lines = [
+                "## Leaderboard",
+                ...formatLeaderboard(guild.id),
+            ];
+
+            return sendLongReply(interaction, lines.join("\n"));
+        }
+
+        // EVERY1S: generate groups without repeating previous pairs.
+        if (interaction.commandName === "every1s") {
+            await interaction.deferReply();
+
+            const rolesInput = interaction.options.getString("roles");
+
+            const roleIds = [
+                ...new Set(
+                    [...rolesInput.matchAll(/<@&(\d+)>/g)]
+                        .map(match => match[1])
+                ),
+            ];
+
+            if (roleIds.length === 0) {
+                return interaction.editReply(
+                    "Please provide at least one actual role mention."
+                );
             }
-        });
 
+            const selectedRoles = roleIds.map(id =>
+                guild.roles.cache.get(id)
+            );
+
+            if (selectedRoles.some(role => !role)) {
+                return interaction.editReply(
+                    "One or more roles could not be found in this server."
+                );
+            }
+
+            await guild.members.fetch();
+
+            const selectedRoleIds = new Set(roleIds);
+
+            const members = [...guild.members.cache.values()].filter(member =>
+                !member.user.bot &&
+                [...selectedRoleIds].some(roleId =>
+                    member.roles.cache.has(roleId)
+                )
+            );
+
+            if (members.length < 2) {
+                return interaction.editReply(
+                    `Only ${members.length} eligible member(s) found. ` +
+                    "At least two members are needed."
+                );
+            }
+
+            const usedPairs = new Set(history[guild.id] || []);
+
+            const result = generateUniqueGroups(members, usedPairs);
+
+            if (!result) {
+                return interaction.editReply(
+                    "I couldn't find a new grouping without repeated pairs " +
+                    "after 10,000 attempts. Try adding members or use /reset " +
+                    "to start a new pairing cycle."
+                );
+            }
+
+            const { groups, newPairs } = result;
+
+            history[guild.id] = [...usedPairs, ...newPairs];
+            saveHistory();
+
+            const lines = groups.map((group, index) => {
+                const mentions = group
+                    .map(member => `<@${member.id}>`)
+                    .join(" + ");
+
+                return `**Group ${index + 1}:** ${mentions}`;
+            });
+
+            return interaction.editReply({
+                content: `**This Week's Every1s**\n${lines.join("\n")}`,
+                allowedMentions: { parse: ["users"] },
+            });
+        }
     } catch (error) {
-        console.error("Error generating groups:", error);
+        console.error("Command error:", error);
 
-        await interaction.editReply(
-            "Something went wrong while generating groups. " +
-            "Check the bot console for details."
-        );
+        const message =
+            "Something went wrong while processing the command. " +
+            "Check the bot logs for details.";
+
+        if (interaction.deferred) {
+            await interaction.editReply(message).catch(console.error);
+        } else if (!interaction.replied) {
+            await interaction.reply({
+                content: message,
+                ephemeral: true,
+            }).catch(console.error);
+        }
     }
 });
 
