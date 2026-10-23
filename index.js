@@ -70,6 +70,7 @@ const every1sCommand = new SlashCommandBuilder()
     );
 
 
+
 const submitCommand = new SlashCommandBuilder()
     .setName("submit")
     .setDescription("Submit a pair or trio for leaderboard points")
@@ -85,12 +86,6 @@ const submitCommand = new SlashCommandBuilder()
             .setDescription("Second member")
             .setRequired(true)
     )
-    .addUserOption(option =>
-        option
-            .setName("member3")
-            .setDescription("Third member (optional)")
-            .setRequired(false)
-    )
     .addStringOption(option =>
         option
             .setName("location")
@@ -101,7 +96,14 @@ const submitCommand = new SlashCommandBuilder()
                 { name: "On-campus (2 points)", value: "on-campus" },
                 { name: "Off-campus (3 points)", value: "off-campus" }
             )
+    )
+    .addUserOption(option =>
+        option
+            .setName("member3")
+            .setDescription("Third member (optional)")
+            .setRequired(false)
     );
+
 
 
 const leaderboardCommand = new SlashCommandBuilder()
